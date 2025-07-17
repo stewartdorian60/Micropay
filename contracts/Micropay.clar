@@ -9,9 +9,19 @@
 (define-constant ERR_INVALID_AMOUNT (err u106))
 (define-constant ERR_LOAN_COMPLETED (err u107))
 (define-constant ERR_FUNDING_PERIOD_ENDED (err u108))
+(define-constant ERR_INSURANCE_NOT_FOUND (err u109))
+(define-constant ERR_INSURANCE_ALREADY_EXISTS (err u110))
+(define-constant ERR_INSURANCE_EXPIRED (err u111))
+(define-constant ERR_CLAIM_ALREADY_PROCESSED (err u112))
+(define-constant ERR_INSUFFICIENT_INSURANCE_POOL (err u113))
+(define-constant ERR_INVALID_COVERAGE_PERCENTAGE (err u114))
+(define-constant ERR_LOAN_NOT_DEFAULTED (err u115))
 
 (define-data-var loan-counter uint u0)
 (define-data-var platform-fee-rate uint u250)
+(define-data-var insurance-policy-counter uint u0)
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var base-insurance-rate uint u500)
 
 (define-map loans
   uint
@@ -51,6 +61,37 @@
     due-block: uint,
     amount: uint,
     paid: bool
+  }
+)
+
+(define-map insurance-policies
+  uint
+  {
+    policy-holder: principal,
+    loan-id: uint,
+    coverage-amount: uint,
+    premium-paid: uint,
+    coverage-percentage: uint,
+    created-at: uint,
+    expires-at: uint,
+    is-active: bool,
+    claim-processed: bool
+  }
+)
+
+(define-map loan-insurance-mapping
+  uint
+  { policy-id: uint, has-insurance: bool }
+)
+
+(define-map insurance-claims
+  uint
+  {
+    policy-id: uint,
+    claim-amount: uint,
+    claimed-at: uint,
+    processed: bool,
+    approved: bool
   }
 )
 
@@ -195,4 +236,161 @@
     (var-set platform-fee-rate new-rate)
     (ok true)
   )
+)
+
+(define-public (purchase-loan-insurance (loan-id uint) (coverage-percentage uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+      (policy-id (+ (var-get insurance-policy-counter) u1))
+      (loan-amount (get amount loan))
+      (coverage-amount (/ (* loan-amount coverage-percentage) u100))
+      (premium-amount (calculate-insurance-premium loan-amount coverage-percentage (get interest-rate loan)))
+      (expiry-block (+ stacks-block-height u144000))
+    )
+    (asserts! (> coverage-percentage u0) ERR_INVALID_COVERAGE_PERCENTAGE)
+    (asserts! (<= coverage-percentage u100) ERR_INVALID_COVERAGE_PERCENTAGE)
+    (asserts! (is-none (map-get? loan-insurance-mapping loan-id)) ERR_INSURANCE_ALREADY_EXISTS)
+    (asserts! (is-eq (get status loan) "pending") ERR_LOAN_NOT_FOUND)
+    
+    (try! (stx-transfer? premium-amount tx-sender (as-contract tx-sender)))
+    (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) premium-amount))
+    
+    (map-set insurance-policies policy-id
+      {
+        policy-holder: tx-sender,
+        loan-id: loan-id,
+        coverage-amount: coverage-amount,
+        premium-paid: premium-amount,
+        coverage-percentage: coverage-percentage,
+        created-at: stacks-block-height,
+        expires-at: expiry-block,
+        is-active: true,
+        claim-processed: false
+      }
+    )
+    
+    (map-set loan-insurance-mapping loan-id
+      { policy-id: policy-id, has-insurance: true }
+    )
+    
+    (var-set insurance-policy-counter policy-id)
+    (ok policy-id)
+  )
+)
+
+(define-public (file-insurance-claim (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (map-get? insurance-policies policy-id) ERR_INSURANCE_NOT_FOUND))
+      (loan-id (get loan-id policy))
+      (loan (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+      (coverage-amount (get coverage-amount policy))
+    )
+    (asserts! (is-eq (get policy-holder policy) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active policy) ERR_INSURANCE_EXPIRED)
+    (asserts! (not (get claim-processed policy)) ERR_CLAIM_ALREADY_PROCESSED)
+    (asserts! (is-eq (get status loan) "defaulted") ERR_LOAN_NOT_DEFAULTED)
+    (asserts! (>= (var-get insurance-pool-balance) coverage-amount) ERR_INSUFFICIENT_INSURANCE_POOL)
+    
+    (try! (as-contract (stx-transfer? coverage-amount tx-sender (get policy-holder policy))))
+    (var-set insurance-pool-balance (- (var-get insurance-pool-balance) coverage-amount))
+    
+    (map-set insurance-policies policy-id
+      (merge policy { claim-processed: true, is-active: false })
+    )
+    
+    (ok coverage-amount)
+  )
+)
+
+(define-public (contribute-to-insurance-pool (amount uint))
+  (begin
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) amount))
+    (ok true)
+  )
+)
+
+(define-public (withdraw-from-insurance-pool (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (var-get insurance-pool-balance) amount) ERR_INSUFFICIENT_INSURANCE_POOL)
+    (try! (as-contract (stx-transfer? amount tx-sender CONTRACT_OWNER)))
+    (var-set insurance-pool-balance (- (var-get insurance-pool-balance) amount))
+    (ok true)
+  )
+)
+
+(define-public (update-insurance-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-rate u2000) ERR_INVALID_AMOUNT)
+    (var-set base-insurance-rate new-rate)
+    (ok true)
+  )
+)
+
+(define-public (cancel-insurance-policy (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (map-get? insurance-policies policy-id) ERR_INSURANCE_NOT_FOUND))
+      (loan-id (get loan-id policy))
+      (refund-amount (/ (get premium-paid policy) u2))
+    )
+    (asserts! (is-eq (get policy-holder policy) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active policy) ERR_INSURANCE_EXPIRED)
+    (asserts! (not (get claim-processed policy)) ERR_CLAIM_ALREADY_PROCESSED)
+    (asserts! (>= (var-get insurance-pool-balance) refund-amount) ERR_INSUFFICIENT_INSURANCE_POOL)
+    
+    (try! (as-contract (stx-transfer? refund-amount tx-sender (get policy-holder policy))))
+    (var-set insurance-pool-balance (- (var-get insurance-pool-balance) refund-amount))
+    
+    (map-set insurance-policies policy-id
+      (merge policy { is-active: false })
+    )
+    
+    (map-set loan-insurance-mapping loan-id
+      { policy-id: policy-id, has-insurance: false }
+    )
+    
+    (ok refund-amount)
+  )
+)
+
+(define-private (calculate-insurance-premium (loan-amount uint) (coverage-percentage uint) (interest-rate uint))
+  (let
+    (
+      (base-premium (/ (* loan-amount (var-get base-insurance-rate)) u10000))
+      (coverage-multiplier (/ coverage-percentage u20))
+      (risk-multiplier (/ interest-rate u1000))
+    )
+    (+ base-premium (* base-premium (+ coverage-multiplier risk-multiplier)))
+  )
+)
+
+(define-read-only (get-insurance-policy (policy-id uint))
+  (map-get? insurance-policies policy-id)
+)
+
+(define-read-only (get-loan-insurance (loan-id uint))
+  (map-get? loan-insurance-mapping loan-id)
+)
+
+(define-read-only (get-insurance-pool-balance)
+  (var-get insurance-pool-balance)
+)
+
+(define-read-only (get-insurance-premium-quote (loan-amount uint) (coverage-percentage uint) (interest-rate uint))
+  (calculate-insurance-premium loan-amount coverage-percentage interest-rate)
+)
+
+(define-read-only (get-total-insurance-policies)
+  (var-get insurance-policy-counter)
+)
+
+(define-read-only (get-base-insurance-rate)
+  (var-get base-insurance-rate)
 )
