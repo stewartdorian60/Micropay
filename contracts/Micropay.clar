@@ -16,12 +16,22 @@
 (define-constant ERR_INSUFFICIENT_INSURANCE_POOL (err u113))
 (define-constant ERR_INVALID_COVERAGE_PERCENTAGE (err u114))
 (define-constant ERR_LOAN_NOT_DEFAULTED (err u115))
+(define-constant ERR_AUCTION_NOT_FOUND (err u116))
+(define-constant ERR_AUCTION_ALREADY_EXISTS (err u117))
+(define-constant ERR_AUCTION_ENDED (err u118))
+(define-constant ERR_AUCTION_NOT_ENDED (err u119))
+(define-constant ERR_BID_TOO_LOW (err u120))
+(define-constant ERR_INVALID_BID_AMOUNT (err u121))
+(define-constant ERR_BIDDER_IS_BORROWER (err u122))
+(define-constant ERR_AUCTION_NOT_ACTIVE (err u123))
 
 (define-data-var loan-counter uint u0)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var insurance-policy-counter uint u0)
 (define-data-var insurance-pool-balance uint u0)
 (define-data-var base-insurance-rate uint u500)
+(define-data-var auction-counter uint u0)
+(define-data-var default-auction-duration uint u1440)
 
 (define-map loans
   uint
@@ -93,6 +103,40 @@
     processed: bool,
     approved: bool
   }
+)
+
+(define-map loan-auctions
+  uint
+  {
+    loan-id: uint,
+    borrower: principal,
+    loan-amount: uint,
+    max-interest-rate: uint,
+    duration-blocks: uint,
+    auction-start: uint,
+    auction-end: uint,
+    status: (string-ascii 20),
+    winning-bid-id: (optional uint),
+    total-bids: uint
+  }
+)
+
+(define-map auction-bids
+  uint
+  {
+    auction-id: uint,
+    bidder: principal,
+    interest-rate: uint,
+    funding-amount: uint,
+    bid-timestamp: uint,
+    is-winning: bool,
+    is-withdrawn: bool
+  }
+)
+
+(define-map auction-bid-mapping
+  { auction-id: uint, bidder: principal }
+  { bid-id: uint, has-bid: bool }
 )
 
 (define-public (make-repayment (loan-id uint) (payment-amount uint))
@@ -394,3 +438,222 @@
 (define-read-only (get-base-insurance-rate)
   (var-get base-insurance-rate)
 )
+
+(define-public (create-loan-auction (loan-id uint) (max-interest-rate uint) (auction-duration uint))
+  (let
+    (
+      (loan (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+      (auction-id (+ (var-get auction-counter) u1))
+      (auction-start stacks-block-height)
+      (auction-end (+ stacks-block-height auction-duration))
+    )
+    (asserts! (is-eq (get borrower loan) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status loan) "pending") ERR_LOAN_NOT_FOUND)
+    (asserts! (> max-interest-rate u0) ERR_INVALID_AMOUNT)
+    (asserts! (> auction-duration u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-none (map-get? loan-auctions loan-id)) ERR_AUCTION_ALREADY_EXISTS)
+    
+    (map-set loan-auctions auction-id
+      {
+        loan-id: loan-id,
+        borrower: tx-sender,
+        loan-amount: (get amount loan),
+        max-interest-rate: max-interest-rate,
+        duration-blocks: (get duration-blocks loan),
+        auction-start: auction-start,
+        auction-end: auction-end,
+        status: "active",
+        winning-bid-id: none,
+        total-bids: u0
+      }
+    )
+    
+    (var-set auction-counter auction-id)
+    (ok auction-id)
+  )
+)
+
+(define-public (place-auction-bid (auction-id uint) (interest-rate uint) (funding-amount uint))
+  (let
+    (
+      (auction (unwrap! (map-get? loan-auctions auction-id) ERR_AUCTION_NOT_FOUND))
+      (bid-id (+ (var-get auction-counter) (get total-bids auction) u1))
+      (loan-id (get loan-id auction))
+      (loan (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+    )
+    (asserts! (not (is-eq (get borrower auction) tx-sender)) ERR_BIDDER_IS_BORROWER)
+    (asserts! (is-eq (get status auction) "active") ERR_AUCTION_NOT_ACTIVE)
+    (asserts! (<= stacks-block-height (get auction-end auction)) ERR_AUCTION_ENDED)
+    (asserts! (<= interest-rate (get max-interest-rate auction)) ERR_BID_TOO_LOW)
+    (asserts! (>= funding-amount (get loan-amount auction)) ERR_INVALID_BID_AMOUNT)
+    (asserts! (> interest-rate u0) ERR_INVALID_AMOUNT)
+    
+    (try! (stx-transfer? funding-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set auction-bids bid-id
+      {
+        auction-id: auction-id,
+        bidder: tx-sender,
+        interest-rate: interest-rate,
+        funding-amount: funding-amount,
+        bid-timestamp: stacks-block-height,
+        is-winning: false,
+        is-withdrawn: false
+      }
+    )
+    
+    (map-set auction-bid-mapping { auction-id: auction-id, bidder: tx-sender }
+      { bid-id: bid-id, has-bid: true }
+    )
+    
+    (map-set loan-auctions auction-id
+      (merge auction { total-bids: (+ (get total-bids auction) u1) })
+    )
+    
+    (ok bid-id)
+  )
+)
+
+(define-public (finalize-auction (auction-id uint))
+  (let
+    (
+      (auction (unwrap! (map-get? loan-auctions auction-id) ERR_AUCTION_NOT_FOUND))
+      (loan-id (get loan-id auction))
+      (loan (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND))
+      (winning-bid-result (find-winning-bid auction-id))
+    )
+    (asserts! (is-eq (get borrower auction) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status auction) "active") ERR_AUCTION_NOT_ACTIVE)
+    (asserts! (> stacks-block-height (get auction-end auction)) ERR_AUCTION_NOT_ENDED)
+    
+    (match winning-bid-result
+      winning-bid-id
+      (let
+        (
+          (winning-bid (unwrap! (map-get? auction-bids winning-bid-id) ERR_AUCTION_NOT_FOUND))
+          (winning-rate (get interest-rate winning-bid))
+          (funding-amount (get funding-amount winning-bid))
+        )
+        (map-set auction-bids winning-bid-id
+          (merge winning-bid { is-winning: true })
+        )
+        
+        (map-set loan-auctions auction-id
+          (merge auction { 
+            status: "completed",
+            winning-bid-id: (some winning-bid-id)
+          })
+        )
+        
+        (map-set loans loan-id
+          (merge loan {
+            interest-rate: winning-rate,
+            funded-amount: funding-amount,
+            funded-at: (some stacks-block-height),
+            status: "active"
+          })
+        )
+        
+        (try! (as-contract (stx-transfer? funding-amount tx-sender (get borrower auction))))
+        (ok winning-bid-id)
+      )
+      (begin
+        (map-set loan-auctions auction-id
+          (merge auction { status: "failed" })
+        )
+        (ok u0)
+      )
+    )
+  )
+)
+
+(define-public (withdraw-bid (auction-id uint))
+  (let
+    (
+      (auction (unwrap! (map-get? loan-auctions auction-id) ERR_AUCTION_NOT_FOUND))
+      (bid-mapping (unwrap! (map-get? auction-bid-mapping { auction-id: auction-id, bidder: tx-sender }) ERR_AUCTION_NOT_FOUND))
+      (bid-id (get bid-id bid-mapping))
+      (bid (unwrap! (map-get? auction-bids bid-id) ERR_AUCTION_NOT_FOUND))
+    )
+    (asserts! (is-eq (get bidder bid) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-withdrawn bid)) ERR_INVALID_AMOUNT)
+    (asserts! (> stacks-block-height (get auction-end auction)) ERR_AUCTION_NOT_ENDED)
+    (asserts! (not (get is-winning bid)) ERR_INVALID_AMOUNT)
+    
+    (try! (as-contract (stx-transfer? (get funding-amount bid) tx-sender (get bidder bid))))
+    
+    (map-set auction-bids bid-id
+      (merge bid { is-withdrawn: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-auction (auction-id uint))
+  (let
+    (
+      (auction (unwrap! (map-get? loan-auctions auction-id) ERR_AUCTION_NOT_FOUND))
+    )
+    (asserts! (is-eq (get borrower auction) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status auction) "active") ERR_AUCTION_NOT_ACTIVE)
+    (asserts! (<= stacks-block-height (get auction-end auction)) ERR_AUCTION_ENDED)
+    
+    (map-set loan-auctions auction-id
+      (merge auction { status: "cancelled" })
+    )
+    (ok true)
+  )
+)
+
+(define-private (refund-single-bid (bid-id uint))
+  (let
+    (
+      (bid (unwrap! (map-get? auction-bids bid-id) (ok false)))
+    )
+    (if (not (get is-withdrawn bid))
+      (begin
+        (try! (as-contract (stx-transfer? (get funding-amount bid) tx-sender (get bidder bid))))
+        (map-set auction-bids bid-id (merge bid { is-withdrawn: true }))
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-private (find-winning-bid (auction-id uint))
+  (let
+    (
+      (auction (unwrap! (map-get? loan-auctions auction-id) (some u0)))
+      (total-bids (get total-bids auction))
+    )
+    (if (> total-bids u0)
+      (some u1)
+      none
+    )
+  )
+)
+
+(define-read-only (get-auction (auction-id uint))
+  (map-get? loan-auctions auction-id)
+)
+
+(define-read-only (get-auction-bid (bid-id uint))
+  (map-get? auction-bids bid-id)
+)
+
+(define-read-only (get-bidder-info (auction-id uint) (bidder principal))
+  (map-get? auction-bid-mapping { auction-id: auction-id, bidder: bidder })
+)
+
+(define-read-only (get-total-auctions)
+  (var-get auction-counter)
+)
+
+(define-read-only (get-auction-duration)
+  (var-get default-auction-duration)
+)
+
+
+
